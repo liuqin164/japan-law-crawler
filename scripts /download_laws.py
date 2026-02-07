@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Download national tax laws (category_cd=13) from e-Gov API v2 and save JSON."""
+"""
+Download ONLY active national tax laws (category_cd=13) from e-Gov API v2.
+Filters out repealed, expired, or loss-of-effectiveness laws for knowledge base use.
+"""
 
 from __future__ import annotations
 
@@ -71,7 +74,7 @@ def fetch_law_data(
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Download national tax laws as JSON.")
+    parser = argparse.ArgumentParser(description="Download active national tax laws as JSON.")
     parser.add_argument("--output-dir", required=True, help="Directory to save JSON files.")
     parser.add_argument("--base-url", default="https://laws.e-gov.go.jp/api/2")
     parser.add_argument("--category-cd", default="13")
@@ -88,33 +91,65 @@ def main() -> int:
         "response_format": "json",
     }
     list_url = build_url(args.base_url, "laws", list_params)
+    
+    print(f"Fetching law list from {list_url}...")
     list_payload = fetch_json(list_url, timeout=args.timeout)
-    law_info_list = list_payload.get("law_info_list", [])
+    
+    # 适配 API 可能存在的 laws_response 包裹层
+    target_data = list_payload.get("laws_response", list_payload)
+    law_info_list = target_data.get("law_info_list", [])
 
     if not isinstance(law_info_list, list):
         raise RuntimeError("Unexpected response format: law_info_list is not a list.")
 
+    print(f"Found {len(law_info_list)} total entries. Starting filtered download...")
+
+    active_count = 0
     for law_info in iter_laws(law_info_list, args.limit):
         law_id, law_num, law_name = extract_law_info(law_info)
         if not law_id:
-            print("Skipping entry without law_id.")
             continue
 
         try:
             law_payload = fetch_law_data(args.base_url, law_id, law_num, args.timeout)
-        except Exception as exc:  # pragma: no cover - log and continue
-            print(f"Failed to fetch law data for {law_id}: {exc}")
+            
+            # --- 方案 B: 有效性过滤逻辑 ---
+            # 兼容 API 嵌套结构获取 revision_info
+            data_root = law_payload.get("law_data_response", law_payload)
+            revision_info = data_root.get("revision_info", {})
+            
+            repeal_status = revision_info.get("repeal_status", "")
+            amendment_type = str(revision_info.get("amendment_type", ""))
+
+            # 过滤规则：
+            # 1. repeal_status 为 Repeal(废止), Expire(失效), LossOfEffectiveness(丧失实效) 时跳过
+            # 2. amendment_type 为 8 (代表废止法令本身) 时跳过
+            if repeal_status in ["Repeal", "Expire", "LossOfEffectiveness"] or amendment_type == "8":
+                print(f"Skipping inactive law: {law_name} (Status: {repeal_status or 'AmendmentType 8'})")
+                continue
+
+            # 保存有效法令
+            safe_num = sanitize_filename(law_num or law_id)
+            safe_name = sanitize_filename(law_name or law_id)
+            filename = output_dir / f"{safe_num}_{safe_name}.json"
+            
+            filename.write_text(json.dumps(law_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            print(f"Saved Active Law: {filename}")
+            active_count += 1
+            
+        except Exception as exc:
+            print(f"Error processing {law_id}: {exc}")
             continue
 
-        safe_num = sanitize_filename(law_num or law_id)
-        safe_name = sanitize_filename(law_name or law_id)
-        filename = output_dir / f"{safe_num}_{safe_name}.json"
-        filename.write_text(json.dumps(law_payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        print(f"Saved {filename}")
         time.sleep(args.sleep_seconds)
 
+    print(f"\nTask Complete. Total active laws saved: {active_count}")
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        print("\nProcess interrupted by user.")
+        raise SystemExit(1)
