@@ -1,132 +1,107 @@
 #!/usr/bin/env python3
 """
-Download ALL active national tax laws from e-Gov API v2.
-Fixed: Implemented pagination to fetch the entire list beyond the first 100 entries.
+Japanese Law Downloader - Optimized for National Tax Knowledge Base.
+- Supports Pagination (fetches all 8000+ law entries)
+- Filters by Category (013 for National Tax)
+- Filters by Validity (Only Active)
+- Includes 'limit' parameter for testing
 """
 
-from __future__ import annotations
 import argparse
 import json
 import re
 import time
-import urllib.error
-import urllib.parse
 import urllib.request
+import urllib.parse
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
 
-def build_url(base_url: str, path: str, params: Dict[str, Any]) -> str:
-    query = urllib.parse.urlencode(params)
-    return f"{base_url.rstrip('/')}/{path.lstrip('/')}?{query}"
+def fetch_json(url, timeout=60):
+    # 增加 User-Agent 模拟浏览器，防止被 e-Gov 拦截
+    req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0 (OpenClaw-Crawler)'})
+    with urllib.request.urlopen(req, timeout=timeout) as response:
+        return json.loads(response.read().decode("utf-8"))
 
-def fetch_json(url: str, timeout: int = 60) -> Dict[str, Any]:
-    with urllib.request.urlopen(url, timeout=timeout) as response:
-        payload = response.read()
-    return json.loads(payload.decode("utf-8"))
-
-def sanitize_filename(value: str) -> str:
-    value = value.strip()
-    value = re.sub(r"\s+", "_", value)
-    value = re.sub(r"[^0-9A-Za-z_\-()\[\]【】]+", "_", value)
-    value = value.strip("_")
-    return value or "unknown"
-
-def fetch_law_data(base_url: str, law_id: str, law_num: Optional[str], timeout: int) -> Dict[str, Any]:
-    params = {"law_full_text_format": "json", "response_format": "json", "extraction_target": "all"}
-    law_url = build_url(base_url, f"law_data/{law_id}", params)
-    try:
-        return fetch_json(law_url, timeout=timeout)
-    except urllib.error.HTTPError as exc:
-        if exc.code != 404 or not law_num: raise
-        fallback_url = build_url(base_url, f"law_data/{law_num}", params)
-        return fetch_json(fallback_url, timeout=timeout)
-
-def main() -> int:
-    parser = argparse.ArgumentParser(description="Download ALL active tax laws with pagination.")
-    parser.add_argument("--output-dir", required=True)
-    parser.add_argument("--base-url", default="https://laws.e-gov.go.jp/api/2")
-    parser.add_argument("--category-cd", default="013")
-    parser.add_argument("--sleep-seconds", type=float, default=0.5)
-    parser.add_argument("--timeout", type=int, default=60)
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--output-dir", required=True, help="Directory to save JSON files")
+    parser.add_argument("--limit", type=int, default=None, help="Stop after downloading N laws (for testing)")
+    parser.add_argument("--category-cd", default="013", help="Category code, 013 is National Tax")
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # --- 翻页抓取全量清单 ---
-    all_tax_laws: List[Dict[str, Any]] = []
+    # 1. 第一步：获取全日本所有法令的 LawID 清单
+    law_id_list = []
     offset = 1
-    limit_per_page = 100 # API 最大单次返回数
+    limit_per_page = 100
     
-    print("正在分批获取法令清单（由于数量较多，可能需要翻页）...")
+    print("🔍 阶段 1: 正在扫描全量法令索引 (翻页中)...", flush=True)
     
     while True:
-        list_params = {
-            "response_format": "json",
-            "offset": offset,
-            "limit": limit_per_page
-        }
-        list_url = build_url(args.base_url, "laws", list_params)
-        
+        list_url = f"https://laws.e-gov.go.jp/api/2/laws?response_format=json&offset={offset}&limit={limit_per_page}"
         try:
-            payload = fetch_json(list_url, timeout=args.timeout)
-            resp = payload.get("laws_response", payload)
-            laws = resp.get("law_info_list", [])
+            data = fetch_json(list_url)
+            laws = data.get("laws_response", {}).get("law_info_list", [])
+            if not laws: break
             
-            if not laws:
-                break # 没有更多数据了
+            # 这里先不按分类过滤，因为清单接口的分类信息不准确
+            law_id_list.extend(laws)
+            print(f"   已发现 {len(law_id_list)} 个条目 (Offset: {offset})...", flush=True)
             
-            # 本地过滤国税分类
-            target_cat = args.category_cd.zfill(3)
-            current_page_tax = [l for l in laws if str(l.get("category_cd", "")).zfill(3) == target_cat]
-            all_tax_laws.extend(current_page_tax)
-            
-            print(f"已扫描偏移量 {offset}，在当前页发现 {len(current_page_tax)} 部国税法令...")
-            
-            # 判断是否需要继续翻页
-            if len(laws) < limit_per_page:
-                break
+            if len(laws) < limit_per_page: break
             offset += limit_per_page
-            
         except Exception as e:
-            print(f"获取清单失败: {e}")
+            print(f"❌ 索引获取失败: {e}")
             break
+        time.sleep(0.1)
 
-    print(f"\n✅ 清单获取完成！在总计约 {offset+len(laws)} 部法令中，筛选出国税法令 {len(all_tax_laws)} 部。")
-
-    # --- 下载详情 ---
+    # 2. 第二步：遍历 LawID，下载详情并进行“双重清洗”
+    print(f"\n📥 阶段 2: 开始下载详情并过滤国税现行法令 (目标分类: {args.category_cd})...", flush=True)
+    
     active_count = 0
-    for law_info in all_tax_laws:
+    for i, law_info in enumerate(law_id_list):
+        if args.limit and active_count >= args.limit:
+            break
+            
         law_id = law_info.get("law_id")
-        law_num = law_info.get("law_num")
         law_name = law_info.get("law_name")
         
         try:
-            law_payload = fetch_law_data(args.base_url, law_id, law_num, args.timeout)
-            data_root = law_payload.get("law_data_response", law_payload)
-            revision = data_root.get("revision_info", {})
+            # 下载详情以获取准确的分类和状态
+            detail_url = f"https://laws.e-gov.go.jp/api/2/law_data/{law_id}?response_format=json&law_full_text_format=json&extraction_target=all"
+            detail_payload = fetch_json(detail_url)
             
-            # 清洗：有效性检查
-            if revision.get("repeal_status") in ["Repeal", "Expire", "LossOfEffectiveness"] or str(revision.get("amendment_type")) == "8":
+            data_root = detail_payload.get("law_data_response", {})
+            revision_info = data_root.get("revision_info", {})
+            
+            # 清洗 A: 检查分类 (必须符合 013)
+            # 注意：详情里的 category_cd 可能在不同层级
+            law_cat = str(revision_info.get("category_cd", "")).zfill(3)
+            if law_cat != args.category_cd.zfill(3):
                 continue
-
-            # 保存
-            safe_num = sanitize_filename(law_num or law_id)
-            safe_name = sanitize_filename(law_name or law_id)
-            filename = output_dir / f"{safe_num}_{safe_name}.json"
             
-            filename.write_text(json.dumps(law_payload, ensure_ascii=False, indent=2), encoding="utf-8")
-            print(f"已保存: {safe_name}")
+            # 清洗 B: 检查有效性 (排掉废止)
+            repeal = revision_info.get("repeal_status")
+            if repeal in ["Repeal", "Expire", "LossOfEffectiveness"]:
+                continue
+            
+            # 存储
+            safe_name = re.sub(r"[^\w\-]", "_", law_name)
+            file_path = output_dir / f"{law_id}_{safe_name[:50]}.json"
+            file_path.write_text(json.dumps(detail_payload, ensure_ascii=False, indent=2))
+            
             active_count += 1
+            print(f"✅ [{active_count}] 已保存: {law_name}", flush=True)
             
-        except Exception as exc:
-            print(f"跳过错误条目 {law_id}: {exc}")
+        except Exception as e:
+            # 忽略下载错误，继续下一个
             continue
+            
+        # 频率控制，防止 API 封禁
+        time.sleep(0.3)
 
-        time.sleep(args.sleep_seconds)
-
-    print(f"\n🚀 任务结束！共下载 {active_count} 部现行有效国税法令。")
-    return 0
+    print(f"\n🚀 任务完成! 共有 {active_count} 部有效国税法令保存至 {args.output_dir}")
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()
